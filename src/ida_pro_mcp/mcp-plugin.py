@@ -1507,6 +1507,38 @@ def get_stack_frame_variables_internal(function_address: int, raise_error: bool)
             ))
     return members
 
+class LocalVariable(TypedDict):
+    name: str
+    type: str
+
+@jsonrpc
+@idaread
+def get_local_variables(
+        function_address: Annotated[str, "Address of the function to retrieve local variables"]
+) -> list[LocalVariable]:
+    """Retrieve all local variables (lvars) from the decompiled function"""
+    address = parse_address(function_address)
+
+    if not ida_hexrays.init_hexrays_plugin():
+        raise IDAError("Hex-Rays decompiler is not available")
+
+    error = ida_hexrays.hexrays_failure_t()
+    cfunc: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(address, error, ida_hexrays.DECOMP_WARNINGS)
+
+    if not cfunc:
+        if error.code == ida_hexrays.MERR_LICENSE:
+            raise DecompilerLicenseError("Decompiler licence is not available")
+
+    lvars = []
+    for lvar in cfunc.get_lvars():
+        lvars.append(LocalVariable(
+            name=lvar.name,
+            type=str(lvar.type())
+        ))
+
+    return lvars
+
+
 class StructureMember(TypedDict):
     name: str
     offset: str
