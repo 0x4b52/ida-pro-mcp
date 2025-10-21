@@ -60,11 +60,24 @@ class RPCRegistry:
             converted_params = []
             for value, (param_name, expected_type) in zip(params, hints.items()):
                 try:
-                    if not isinstance(value, expected_type):
-                        value = expected_type(value)
+                    # Handle generic types (e.g., dict[str, str], list[int])
+                    import typing
+                    origin = typing.get_origin(expected_type)
+
+                    if origin is not None:
+                        # Generic type - check against origin (e.g., dict, list)
+                        if not isinstance(value, origin):
+                            value = origin(value)
+                    else:
+                        # Simple type - check directly
+                        if not isinstance(value, expected_type):
+                            value = expected_type(value)
+
                     converted_params.append(value)
                 except (ValueError, TypeError):
-                    raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected {expected_type.__name__}")
+                    # Get readable type name
+                    type_name = getattr(expected_type, '__name__', str(expected_type))
+                    raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected {type_name}")
 
             return func(*converted_params)
         elif isinstance(params, dict):
@@ -76,11 +89,24 @@ class RPCRegistry:
             for param_name, expected_type in hints.items():
                 value = params.get(param_name)
                 try:
-                    if not isinstance(value, expected_type):
-                        value = expected_type(value)
+                    # Handle generic types (e.g., dict[str, str], list[int])
+                    import typing
+                    origin = typing.get_origin(expected_type)
+
+                    if origin is not None:
+                        # Generic type - check against origin (e.g., dict, list)
+                        if not isinstance(value, origin):
+                            value = origin(value)
+                    else:
+                        # Simple type - check directly
+                        if not isinstance(value, expected_type):
+                            value = expected_type(value)
+
                     converted_params[param_name] = value
                 except (ValueError, TypeError):
-                    raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected {expected_type.__name__}")
+                    # Get readable type name
+                    type_name = getattr(expected_type, '__name__', str(expected_type))
+                    raise JSONRPCError(-32602, f"Invalid type for parameter '{param_name}': expected {type_name}")
 
             return func(**converted_params)
         else:
@@ -1221,6 +1247,65 @@ def rename_local_variable(
     if not ida_hexrays.rename_lvar(func.start_ea, old_name, new_name):
         raise IDAError(f"Failed to rename local variable {old_name} in function {hex(func.start_ea)}")
     refresh_decompiler_ctext(func.start_ea)
+
+class BulkRenameModifier(ida_hexrays.user_lvar_modifier_t):
+    """Helper class for bulk renaming local variables"""
+    def __init__(self, rename_map: dict[str, str], ulv: ida_hexrays.lvar_uservec_t):
+        ida_hexrays.user_lvar_modifier_t.__init__(self)
+        self.rename_map = rename_map
+        self.ulv = ulv
+
+    def modify_lvars(self, lvinf):
+        """Apply the bulk rename by replacing lvinf.lvvec with our prepared vector"""
+        lvinf.lvvec = self.ulv.lvvec
+        return True
+
+@jsonrpc
+@idawrite
+def bulk_rename_local_variables(
+    function_address: Annotated[str, "Address of the function containing the variables"],
+    rename_map: Annotated[dict[str, str], "Dictionary mapping old variable names to new names"],
+):
+    """Rename multiple local variables in a function at once (more efficient than calling rename_local_variable multiple times)"""
+    func = idaapi.get_func(parse_address(function_address))
+    if not func:
+        raise IDAError(f"No function found at address {function_address}")
+
+    if not ida_hexrays.init_hexrays_plugin():
+        raise IDAError("Hex-Rays decompiler is not available")
+
+    # Decompile the function to get local variables
+    cfunc = decompile_checked(func.start_ea)
+    lvars = cfunc.get_lvars()
+
+    # Build the lvar_uservec_t with renamed variables
+    ulv = ida_hexrays.lvar_uservec_t()
+    ulv.clear()
+
+    renamed_count = 0
+    for lv in lvars:
+        oldname = lv.name
+        if oldname in rename_map:
+            newname = rename_map[oldname]
+
+            # Create lvar_saved_info_t for this variable
+            saved = ida_hexrays.lvar_saved_info_t()
+            saved.ll = lv  # IDA 9.0: lvar_t is already a locator
+            saved.name = newname
+
+            ulv.lvvec.push_back(saved)
+            renamed_count += 1
+
+    if renamed_count == 0:
+        raise IDAError(f"None of the specified variables were found in function {hex(func.start_ea)}")
+
+    # Apply the bulk rename using user_lvar_modifier_t
+    modifier = BulkRenameModifier(rename_map, ulv)
+    if not ida_hexrays.modify_user_lvars(func.start_ea, modifier):
+        raise IDAError(f"Failed to bulk rename local variables in function {hex(func.start_ea)}")
+
+    refresh_decompiler_ctext(func.start_ea)
+    return f"Successfully renamed {renamed_count} variable(s)"
 
 @jsonrpc
 @idawrite
